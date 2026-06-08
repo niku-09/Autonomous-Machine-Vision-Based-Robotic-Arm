@@ -1,2 +1,349 @@
-# Autonomous-Machine-Vision-Based-Robotic-Arm
-Warehouse Robot Sorting Autonomous Robotic System
+# Vision-Guided Autonomous Package Sorting Robot
+
+A low-cost autonomous robotic sorting system integrating a 4-DOF robotic arm, an overhead USB camera, and a custom Python pipeline to detect, classify, and physically sort packages into designated drop zones — all controlled through a live web dashboard.
+
+**Team:** Nikhil (22BMH1014), Nekha Sudheer (22BMH1129), Abhinav Shaji Kumar (22BMH1130)
+
+---
+
+## What It Does
+
+1. A USB webcam mounted overhead detects cardboard boxes placed on a checkerboard workspace.
+2. Coloured stickers on each box are classified into one of five sorting categories.
+3. The system computes the real-world coordinates of each box using a two-phase camera calibration pipeline.
+4. A closed-form inverse kinematics solver computes the joint angles needed to reach each box.
+5. Joint angles are sent over serial to an Arduino Uno, which drives three servo motors to execute a pick-and-place sequence.
+6. The sorted package is deposited into the correct labelled drop zone.
+7. A Flask web dashboard (SortOS) provides a live camera feed, sort commands, inventory tracking, and session statistics.
+
+---
+
+## System Architecture
+
+```
+┌─────────────────────────────────────────────────────┐
+│                      sortos.py                      │
+│  Flask web server + threading + orchestration loop  │
+└────────┬──────────────┬──────────────┬──────────────┘
+         │              │              │
+  detect_boxes.py  classify_box.py  robot_arm_IK.py
+  (box detection)  (sticker color)  (IK + FK check)
+         │              │              │
+         └──────────────┴──────────────┘
+                        │
+              Serial (9600 baud, COM4)
+                        │
+            robot_arm_pick_place.ino
+            (Arduino Uno — servo control)
+```
+
+**Pipeline per package:**
+```
+Frame capture → CLAHE preprocessing → Background subtraction →
+Contour filtering + ARM_EXCLUSION_ZONE → Box detected →
+HSV + LAB dual-space sticker classification →
+Pixel → Homography → Board frame → Robot frame →
+IK solve → FK verify (±0.5 cm) → Serial send →
+Arduino sweep → Pick → Lift → Transit → Drop → Home
+```
+
+---
+
+## Hardware
+
+| Component | Spec |
+|---|---|
+| Arm configuration | 4-DOF: RRR + gripper |
+| Servo 1 (base) | MG995 — Pin 9 |
+| Servo 2 (forearm) | MG995 — Pin 10, direction reversed |
+| Servo 3 (upper arm) | MG995 — Pin 11 |
+| Servo 4 (gripper) | SG90 — Pin 6. Open = 90°, Closed = 70° |
+| Link lengths | L1 = 13.5 cm, L2 = 12.0 cm, L3 = 24.0 cm |
+| Microcontroller | Arduino Uno (COM4) |
+| Power | 5V 6A adapter |
+| Camera | OKER USB webcam, mounted ~40.2 cm overhead |
+| Workspace | 8×6 inner corner checkerboard, 2.9 cm squares |
+| Boxes | 3 cm tall cardboard boxes with coloured stickers |
+
+**Servo offsets (kinematic zero → servo pulse):**
+```
+servo1 = 90.00 + θ1
+servo2 = 115.71 − θ2    (direction reversed)
+servo3 = 6.69  + θ3
+```
+
+**Joint limits:**
+```
+θ1: ±75°    θ2: −50° / +85°    θ3: +40° / +148°
+```
+
+---
+
+## Sorting Categories
+
+| Label | Sticker Colour | Drop Zone (robot frame) |
+|---|---|---|
+| FRAGILE | Red | (25, −20) cm |
+| IMMEDIATE | Green | (25, +22) cm |
+| ZONE_A | Yellow / orange-yellow | (20, −22) cm |
+| ZONE_B | Cyan | (10, −22) cm |
+| DAMAGED | Purple | (15, +22) cm |
+
+---
+
+## Repository Structure
+
+```
+project/
+├── sortos.py                   ← Primary entry point. Flask dashboard + robot control.
+│                                 Run this for normal operation.
+├── main.py                     ← CLI-based sorting orchestrator (alternative to sortos.py)
+├── detect_boxes.py             ← Box detection: background subtraction, CLAHE, contour
+│                                 filtering, temporal persistence, ARM_EXCLUSION_ZONE
+├── classify_box.py             ← Sticker classification: dual HSV (55%) + LAB (45%)
+│                                 voting, inner-crop boost, shadow pixel exclusion
+├── robot_arm_IK.py             ← Closed-form IK solver + FK verification. Also runnable
+│                                 standalone for workspace testing.
+├── pick_and_place.py           ← Standalone pick-and-place sequence with offset correction.
+│                                 Used for single-box testing.
+├── calibrate.py                ← Two-phase camera calibration:
+│                                 Phase 1: Zhang's method (intrinsics, K matrix)
+│                                 Phase 2: solvePnP (extrinsics, camera-to-board transform)
+├── test_coordinate.py          ← Development tool: detect a box, move arm above it,
+│                                 test grasp without full sort sequence.
+├── dashboard_server.py         ← View-only dashboard (no robot control). Early version.
+├── calibration.npz             ← Saved calibration data: K, dist, H, T_checker→robot, cam_t
+└── robot_arm_pick_place.ino    ← Arduino firmware: serial protocol parser, sweepAll()
+                                  interpolation, servo angle clamping.
+```
+
+> **Note:** `calibration.npz` must be generated by running `calibrate.py` before the system will operate. It is not committed to the repository since it is hardware-specific.
+
+---
+
+## Vision Pipeline
+
+### Box Detection (`detect_boxes.py`)
+
+- Background subtraction (colour-agnostic — works for any box colour)
+- CLAHE preprocessing for lighting robustness
+- Otsu thresholding + contour analysis
+- Temporal persistence filter (box must appear in N consecutive frames)
+- `ARM_EXCLUSION_ZONE` polygon masks the robot arm from the camera's field of view to prevent false detections
+
+### Sticker Classification (`classify_box.py`)
+
+Dual colour-space voting:
+- **HSV weight: 55%** — hue histogram on inner crop of bounding box
+- **LAB weight: 45%** — `a*` and `b*` channel analysis for lighting-invariant colour
+- Shadow pixels excluded before voting
+- ZONE_A hue range: (10°, 42°) — accounts for printed yellow appearing orange under lab lighting
+
+---
+
+## Inverse Kinematics
+
+Closed-form geometric solution (no iterative solver):
+
+```
+θ1 = atan2(y, x)                                             # base rotation
+r  = √(x² + y²),  z' = z − L1                               # planar decomposition
+cos(θ3) = (r² + z'² − L2² − L3²) / (2·L2·L3)               # law of cosines
+θ3 = atan2(+√(1−cos²θ3), cos θ3)                            # elbow-up only
+k1 = L2 + L3·cos(θ3),  k2 = L3·sin(θ3)
+θ2 = atan2(r, z') − atan2(k2, k1)                           # shoulder angle
+```
+
+FK verification runs before every serial command. If the FK-recomputed position differs from the target by more than 0.5 cm, the command is rejected.
+
+**Validated results:**
+- 50 targets tested, 100% IK success rate
+- Average FK verification error: 0.18 cm (max 0.47 cm)
+- Solver execution time: 0.23 ms per query
+
+---
+
+## Camera Calibration
+
+**Phase 1 — Intrinsic (Zhang's method):**
+
+```bash
+python calibrate.py
+# Hold checkerboard at ~20 positions/tilts, press SPACE each time, then press C
+```
+
+Outputs: 3×3 camera matrix K, distortion coefficients. Reprojection RMS achieved: 1.43 pixels.
+
+**Phase 2 — Extrinsic (solvePnP):**
+
+Board placed in its fixed working position. `solvePnP` computes the rotation matrix R and translation vector t. Camera height auto-extracted: 40.20 cm.
+
+**Coordinate transform chain:**
+```
+Pixel (u,v) → Homography H⁻¹ → Board frame (cm) → T_checker→robot → Robot frame (x,y,z,cm)
+```
+
+Coordinate accuracy: ±0.3–0.4 cm against ruler measurements.
+
+---
+
+## Arduino Firmware (`robot_arm_pick_place.ino`)
+
+**Serial protocol (9600 baud):**
+
+```
+Python → Arduino:   "T1,T2,T3\n"          → move, gripper unchanged
+                    "T1,T2,T3,G\n"        → move + set gripper angle
+Arduino → Python:   "OK:s1,s2,s3,g\n"    → confirmation
+                    "ERR:reason\n"        → failure
+```
+
+**Motion profiles:**
+
+| Profile | Step size | Delay | Used for |
+|---|---|---|---|
+| Normal | 1.5°/step | 12 ms | Approach, transit, retract |
+| Slow | 0.5°/step | 25 ms | Descent, grasp, lift |
+
+All three arm servos are swept simultaneously (`sweepAll()`). Gripper always uses slow profile.
+
+**Pick-and-place sequence:**
+```
+HOME → APPROACH (x,y, z=13cm) → DESCEND (x,y, z=1.0cm) →
+CLOSE GRIPPER → STAGED LIFT (base fixed, joints raise) →
+TWIST TO DROP ZONE → LOWER → OPEN GRIPPER →
+LIFT → HOME
+```
+
+---
+
+## SortOS Dashboard (`sortos.py`)
+
+Flask web app at `http://localhost:5000`.
+
+- MJPEG live camera feed with bounding boxes and labels overlaid
+- Sort command input + quick-sort chips (Fragile, Zone A, Zone B, Immediate, Damaged, Sort All)
+- Real-time inventory tracking — package IDs (PKG-0001, PKG-0002, ...)
+- Activity log + sorted history log
+- Session throughput KPI and trend chart
+- Confidence threshold slider (routes low-confidence detections to uncertain queue)
+- Toast notifications on sort events
+- Robot status bar (IDLE / BUSY / DONE)
+
+---
+
+## Performance Results
+
+| Metric | Result |
+|---|---|
+| Packages tested | 20 |
+| Successful cycles | 18 / 20 (90%) |
+| Failure cause | SG90 gripper servo backlash (2 cases) |
+| Classification errors | 0 / 20 |
+| Average cycle time | 7.8 seconds |
+| Fastest cycle | 6.4 seconds |
+| Slowest cycle | 10.2 seconds |
+| Throughput | ≈7.7 picks/minute |
+| IK solver accuracy (FK check) | 0.18 cm avg, 0.47 cm max |
+| Coordinate detection accuracy | ±0.3–0.4 cm |
+| YOLOv8 mAP (separately trained) | 91.4% @ IoU 0.5 |
+
+---
+
+## YOLOv8 Model (Supplementary)
+
+A YOLOv8 model was trained separately by a team member for box-type detection on larger packages:
+
+- Dataset: 4,222 annotated images, 5 classes (standard, carton, cracked, opened, wet)
+- mAP @ IoU 0.5: **91.4%**
+- False positive rate: <3%
+- Inference: ~112 ms/frame on CPU
+
+This model was demonstrated separately and was not integrated into the production sorting pipeline for the prototype scale. The production system uses background subtraction for box detection and HSV+LAB for sticker classification.
+
+---
+
+## Dependencies
+
+```bash
+pip install flask opencv-python numpy pyserial
+```
+
+Python 3.11+ recommended. Arduino IDE required to flash the firmware.
+
+---
+
+## Setup and Running
+
+### 1. Flash the Arduino
+
+Open `robot_arm_pick_place.ino` in Arduino IDE and upload to the Uno. Verify the correct COM port (default in code: COM4 — update in `sortos.py` if different).
+
+### 2. Run camera calibration (first time only)
+
+Place the checkerboard flat in the working area under the camera.
+
+```bash
+python calibrate.py
+```
+
+Follow the prompts:
+- Move checkerboard to ~20 different tilts/positions, press SPACE each time
+- Press C to calibrate
+- Place board in its fixed working position, press SPACE once
+- Enter the physical offset from the board origin to the robot base (measured with a ruler)
+
+This writes `calibration.npz`. Only needs to be run once unless the camera or board is moved.
+
+### 3. Run the system
+
+```bash
+python sortos.py
+```
+
+Browser opens at `http://localhost:5000`.
+
+- Clear the workspace of all boxes
+- Click **Capture Background** in the dashboard
+- Place coloured-sticker boxes on the checkerboard
+- Type a command (`sort fragile`, `sort all`, etc.) or click a chip
+
+### 4. Coordinate testing (optional)
+
+```bash
+python test_coordinate.py
+```
+
+Click on a box in the preview window. The arm moves above it and attempts a grasp. Useful for verifying calibration accuracy before running a full sort.
+
+### 5. CLI mode (no dashboard)
+
+```bash
+python main.py
+```
+
+Type `sort fragile`, `sort zone a`, `sort all`, etc. at the prompt.
+
+---
+
+## Key Constants (set in `sortos.py` / `pick_and_place.py`)
+
+```python
+SERIAL_PORT   = "COM4"
+BAUD_RATE     = 9600
+APPROACH_Z    = 13.0   # cm — safe travel height
+GRASP_Z       = 1.0    # cm — gripper descent target
+DROP_Z        = 17.0   # cm — release height above bin
+GRIPPER_OPEN  = 90     # degrees
+GRIPPER_CLOSE = 70     # degrees (for 3 cm boxes)
+THETA1_OFFSET = 5.0    # empirical lateral correction
+THETA3_OFFSET = 5.0    # empirical height correction
+X_OFFSET      = -2.0   # cm — coordinate transform fine-tune
+Y_OFFSET      = +2.0   # cm — coordinate transform fine-tune
+```
+
+---
+
+---
+
+> **Note\*** — Some of the code was altered because the original scripts were iteratively developed and contain hardware-specific constants (COM port, servo offsets, coordinate transforms) calibrated to our physical setup. If replicating, these values will need to be re-measured and updated for your hardware.
